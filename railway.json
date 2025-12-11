@@ -1,9 +1,0 @@
-{
-  "build": {
-    "builder": "docker",
-    "dockerfilePath": "Dockerfile"
-  },
-  "deploy": {
-    "restartPolicy": "always"
-  }
-}
