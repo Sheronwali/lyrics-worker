@@ -1,0 +1,9 @@
+{
+  "build": {
+    "builder": "docker"
+  },
+  "deploy": {
+    "restartPolicy": "always"
+  }
+}
+

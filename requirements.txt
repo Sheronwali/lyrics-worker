@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+supabase
+upstash-redis
+syncedlyrics
+prometheus-fastapi-instrumentator
+prometheus_client
+

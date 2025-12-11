@@ -1,0 +1,147 @@
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from supabase import create_client, Client
+
+from upstash_redis import Redis
+from dotenv import load_dotenv
+import syncedlyrics
+import os, re, time, httpx
+
+# --- Load environment variables ---
+load_dotenv()
+
+# --- CONFIG ---
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("❌ Missing Supabase configuration")
+
+# --- Persistent HTTP session for Supabase ---
+session = httpx.Client(http2=True, timeout=10.0)
+
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# --- Redis (Upstash) ---
+r = Redis(
+    url=os.getenv("UPSTASH_REDIS_REST_URL"),
+    token=os.getenv("UPSTASH_REDIS_REST_TOKEN"),
+)
+
+# --- FastAPI App ---
+app = FastAPI(title="Lyrics Saver API", version="1.7 (Pooling + Redis)")
+
+
+# --- Request Model ---
+class SongRequest(BaseModel):
+    artist: str
+    song: str
+
+
+# --- Utility: Normalize Redis Key ---
+def normalize_key(artist: str, song: str) -> str:
+    clean_artist = re.sub(r"[^a-z0-9]+", "", artist.lower())
+    clean_song = re.sub(r"[^a-z0-9]+", "", song.lower())
+    return f"{clean_artist}:{clean_song}"
+
+
+# --- Save to Supabase and Redis ---
+def save_lyrics_to_db_and_cache(artist: str, song: str, lyrics: str):
+    """Save lyrics to Supabase and Redis cache."""
+    try:
+        supabase.table("lyrics").insert(
+            {"artist": artist, "song": song, "lyrics": lyrics}
+        ).execute()
+
+        key = normalize_key(artist, song)
+        r.setex(key, 86400, lyrics)  # 24h expiry
+        print(f"✅ Cached in Redis: {key}")
+    except Exception as e:
+        print(f"⚠️ Failed to save lyrics: {e}")
+
+
+# --- Main Endpoint ---
+@app.post("/lyrics")
+def get_or_store_lyrics(req: SongRequest, background_tasks: BackgroundTasks):
+    key = normalize_key(req.artist, req.song)
+    timings = {}
+
+    try:
+        # 1️⃣ Check Redis
+        start = time.perf_counter()
+        cached = r.get(key)
+        timings["redis_lookup_ms"] = round((time.perf_counter() - start) * 1000, 2)
+
+        if cached:
+            return {
+                "message": "✅ Lyrics retrieved from Redis cache.",
+                "artist": req.artist,
+                "song": req.song,
+                "source": "redis",
+                "lyrics": cached,
+                "timings": timings,
+            }
+
+        # 2️⃣ Check Supabase
+        start = time.perf_counter()
+        existing = (
+            supabase.table("lyrics")
+            .select("lyrics")
+            .eq("artist", req.artist)
+            .eq("song", req.song)
+            .execute()
+        )
+        timings["supabase_lookup_ms"] = round((time.perf_counter() - start) * 1000, 2)
+
+        if existing.data:
+            lyrics = existing.data[0]["lyrics"]
+            r.setex(key, 86400, lyrics)
+            return {
+                "message": "✅ Lyrics retrieved from Supabase (cached in Redis).",
+                "artist": req.artist,
+                "song": req.song,
+                "source": "supabase",
+                "lyrics": lyrics,
+                "timings": timings,
+            }
+
+        # 3️⃣ Fetch Online
+        start = time.perf_counter()
+        lyrics = syncedlyrics.search(f"{req.artist} - {req.song}")
+        timings["online_fetch_ms"] = round((time.perf_counter() - start) * 1000, 2)
+
+        if not lyrics:
+            raise HTTPException(status_code=404, detail="Lyrics not found online.")
+
+        background_tasks.add_task(save_lyrics_to_db_and_cache, req.artist, req.song, lyrics)
+
+        return {
+            "message": "🌐 Lyrics fetched online (saving asynchronously).",
+            "artist": req.artist,
+            "song": req.song,
+            "source": "online",
+            "lyrics": lyrics,
+            "timings": timings,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server Error: {e}")
+
+
+# --- Graceful Shutdown ---
+@app.on_event("shutdown")
+def close_session():
+    session.close()
+    print("🧹 Closed Supabase HTTP session.")
+
+
+# --- Health Route ---
+@app.get("/")
+def root():
+    return {
+        "message": "Lyrics Saver API with Supabase pooling + Upstash Redis is running!",
+        "region": os.getenv("REGION", "ap-south-1"),
+    }
