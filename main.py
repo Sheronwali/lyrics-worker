@@ -56,6 +56,7 @@ origins = [
     "https://eead2fdd112c.ngrok-free.app",
     "https://eead2fdd112c.ngrok-free.app",
     "https://5064c44b8d66.ngrok-free.app",
+    "https://0d6a81ce5acb.ngrok-free.app",
 ]
 
 app.add_middleware(
